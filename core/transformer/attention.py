@@ -1,30 +1,48 @@
-'''
------------------------------------------------------------------------------
-Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
-NVIDIA CORPORATION and its licensors retain all intellectual property
-and proprietary rights in and to this software, related documentation
-and any modifications thereto. Any use, reproduction, disclosure or
-distribution of this software and related documentation without an express
-license agreement from NVIDIA CORPORATION is strictly prohibited.
------------------------------------------------------------------------------
-'''
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 
 import kiui
 
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
     FLASH_ATTN_AVAILABLE = True
 except:
     print('[WARN] flash_attn not available, using naive implementation')
     FLASH_ATTN_AVAILABLE = False
 
-def attention(q, k, v, mask_q=None, mask_kv=None, dropout=0, causal=False):
+
+# flashattn 2.7.0 changes unpad_input API... we are overriding it here
+def unpad_input(hidden_states, attention_mask):
+    """
+    Arguments:
+        hidden_states: (batch, seqlen, ...)
+        attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
+    Return:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+    """
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the
+    # bool mask, then call nonzero to get the indices, then index with those. The indices is @dim
+    # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
+    # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
+    # so we write custom forward and backward to make it a bit faster.
+    return (
+        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+def attention(q, k, v, mask_q=None, mask_kv=None, dropout=0, causal=False, window_size=(-1, -1), backend='flash-attn'):
     # q: (B, N, H, D)
     # k: (B, M, H, D)
     # v: (B, M, H, D)
@@ -40,12 +58,12 @@ def attention(q, k, v, mask_q=None, mask_kv=None, dropout=0, causal=False):
     if causal: 
         assert N == 1 or N == M, 'Causal mask only supports self-attention'
 
-    # unmasked case
+    ### unmasked case (usually inference)
+    ### will ignore window_size except flash-attn impl. Only provide the effective window!
     if mask_q is None and mask_kv is None:
-        if FLASH_ATTN_AVAILABLE:
-            return flash_attn_func(q, k, v, dropout, causal=causal) # [B, N, H, D]
-        else:
-            # naive implementation
+        if backend == 'flash-attn' and FLASH_ATTN_AVAILABLE:
+            return flash_attn_func(q, k, v, dropout, causal=causal, window_size=window_size) # [B, N, H, D]
+        else: # naive implementation
             q = q.transpose(1, 2).reshape(B * H, N, D)
             k = k.transpose(1, 2).reshape(B * H, M, D)
             v = v.transpose(1, 2).reshape(B * H, M, D)
@@ -61,7 +79,8 @@ def attention(q, k, v, mask_q=None, mask_kv=None, dropout=0, causal=False):
             out = out.reshape(B, H, N, D).transpose(1, 2).contiguous() # [B, N, H, D]
             return out
     
-    # at least one of q or kv is masked, but we need both masks for varlen_func anyway
+    ### at least one of q or kv is masked (training)
+    ### only support flash-attn for now...
     if mask_q is None:
         mask_q = torch.ones(B, N, dtype=torch.bool, device=q.device)
     elif mask_kv is None:
@@ -86,6 +105,7 @@ def attention(q, k, v, mask_q=None, mask_kv=None, dropout=0, causal=False):
             max_seqlen_k=max_len_kv,
             dropout_p=dropout,
             causal=causal,
+            window_size=window_size,
         )
 
         # pad (put back) output
